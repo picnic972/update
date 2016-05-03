@@ -1,4 +1,5 @@
 __author__ = 'powergx'
+from flask import Flask,render_template
 import config, socket, redis
 import time
 from login import login
@@ -6,6 +7,17 @@ from datetime import datetime, timedelta
 from multiprocessing import Process
 from multiprocessing.dummy import Pool as ThreadPool
 import threading
+from threading import Thread
+from flask.ext.mail import Mail,Message
+import re
+
+app = Flask(__name__)
+app.config['MAIL_SERVER'] = 'smtp.163.com'
+app.config['MAIL_PORT'] = '25'
+app.config['MAIL_USE_TLS'] = True
+app.config['MAIL_USERNAME'] = '你的邮箱地址'
+app.config['MAIL_PASSWORD'] = '你的SMTP秘钥'
+mail = Mail(app)
 
 conf = None
 if socket.gethostname() == 'GXMBP.local':
@@ -70,6 +82,7 @@ def get_data(username):
                 account_data['privilege'] = get_privilege(cookies)
             else:
                 account_data = json.loads(exist_account_data.decode('utf-8'))
+                last_account_data = json.loads(exist_account_data.decode('utf-8'))
 
             if account_data.get('updated_time') is not None:
                 last_updated_time = datetime.strptime(account_data.get('updated_time'), '%Y-%m-%d %H:%M:%S')
@@ -94,6 +107,33 @@ def get_data(username):
                 if r.get('r') == 0:
                     r_session.setex('can_drawcash', r.get('is_tm'), 60)
 
+            status_dict={}
+            space_dict={}
+            user_key = '%s:%s' % ('user', username)
+            user_info = json.loads(r_session.get(user_key).decode('utf-8'))
+
+            cookies['user_info']=user_info
+            for dev in last_account_data['device_info']:
+                status_dict[dev['device_name']]=dev['status']
+                for i,client in enumerate(dev['dcdn_clients']):
+                    space_dict['%s_%s' % (dev['device_name'],i)]=client['space_used']
+            if account_data['device_info'] is not None:
+                for dev in account_data['device_info']:
+                    status_last=status_dict[dev['device_name']]
+                    if dev['dcdn_clients'] is not None: 
+                        if dev['status'] != 'online':
+                            if status_last is not None and dev['status'] is not None and status_last == 'online':
+                                red_log(cookies, '矿机异常', '状态', '%s:%s -> %s' % (dev['device_name'],status_last,dev['status'],))
+                                if validateEmail(user_info['mail_address']) == 1:
+                                    msg = Message('矿机异常',sender=app.config['MAIL_USERNAME'],recipients=[user_info['mail_address']])
+                                    msg.body = '您的矿机:%s\n状态： %s -> %s\n时间:%s' % (dev['device_name'],status_dict[dev['device_name']],dev['status'],datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+                                    msg.html = '您的矿机:%s<br />状态： %s -> %s<br />时间:%s' % (dev['device_name'],status_dict[dev['device_name']],dev['status'],datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+                                    thread = Thread(target=send_async_email,args=[app,msg])
+                                    thread.start()
+                        for i,client in enumerate(dev['dcdn_clients']):
+                            space_last=space_dict['%s_%s' % (dev['device_name'],i)]
+                            if space_last is not None and client['space_used'] is not None and int(client['space_used'])<int(space_last):
+                                red_log(cookies, '缓存变动', '状态', '%s: %.2fGB -> %.2fGB' % (dev['device_name'],float(space_last)/1024/1024/1024),float(client['space_used'])/1024/1024/1024)
         if start_time.day == datetime.now().day:
             save_history(username)
 
@@ -125,6 +165,7 @@ def save_history(username):
     today_data['produce_stat'] = [] 
     today_data['award_income'] = 0
     today_data['w_award_income'] = 0
+    today_data['m_award_income'] = 0
 
     for user_id in r_session.smembers('accounts:%s' % username):
         # 获取账号所有数据
@@ -149,6 +190,7 @@ def save_history(username):
         today_data.get('produce_stat').append(dict(mid=data.get('privilege').get('mid'), hourly_list=data.get('produce_info').get('hourly_list')))
         today_data['award_income'] += getaward_crystal_income(username, user_id.decode('utf-8'),0)
         today_data['w_award_income'] += getaward_crystal_income(username, user_id.decode('utf-8'),1)
+        today_data['m_award_income'] += getaward_crystal_income(username, user_id.decode('utf-8'),2)
         today_data['pdc'] += today_data['award_income'] 
         for device in data.get('device_info'):
             today_data['last_speed'] += int(int(device.get('dcdn_upload_speed')) / 1024)
@@ -284,7 +326,12 @@ def check_collect(user, cookies, user_info):
     mine_info = get_mine_info(cookies)
     time.sleep(2)
     if mine_info.get('r') != 0: return
-    if mine_info.get('td_not_in_a') > 16000:
+    if 'collect_crystal_modify' in user_info.keys():
+        limit=user_info.get('collect_crystal_modify')
+    else:
+        limit=16000;
+
+    if mine_info.get('td_not_in_a') > limit:
         r = collect(cookies)
         if r.get('rd') != 'ok':
             log = '%s' % r.get('rd')
@@ -296,9 +343,10 @@ def check_collect(user, cookies, user_info):
 # 执行自动提现的函数
 def check_drawcash(user, cookies, user_info):
     print(datetime.now().strftime('%Y-%m-%d %H:%M:%S'), 'check_drawcash')
-    limit=user_info.get('draw_money_modify')
-    if limit is None:
-        limit=10.0;
+    if 'draw_money_modify' in user_info.keys():
+        limit=user_info.get('draw_money_modify')
+    else:
+        limit=10.0
     r = exec_draw_cash(cookies=cookies, limits=limit)
     red_log(user, '自动执行', '提现', r.get('rd'))
     time.sleep(3)
@@ -400,10 +448,15 @@ def getaward_crystal_income(username, user_id, weekly):
                 award_income += check_award_income(item.get('gets'))
             elif log_time.day == now.day and user_id == item.get('id') and item.get('gets').find('水晶') != -1 and '转盘' == item.get('type'):
                 award_income += check_award_income(item.get('gets'))
-        else:
+        elif weekly == 1:
             if log_time.isocalendar()[0] == now.isocalendar()[0] and log_time.isocalendar()[1] == now.isocalendar()[1] and user_id == item.get('id') and item.get('gets').find('开启') != -1 and '宝箱' == item.get('type'):
                 award_income += check_award_income(item.get('gets'))
             elif log_time.isocalendar()[0] == now.isocalendar()[0] and log_time.isocalendar()[1] == now.isocalendar()[1] and user_id == item.get('id') and item.get('gets').find('水晶') != -1 and '转盘' == item.get('type'):
+                award_income += check_award_income(item.get('gets'))
+        else:
+            if log_time.month == now.month and user_id == item.get('id') and item.get('gets').find('开启') != -1 and '宝箱' == item.get('type'):
+                award_income += check_award_income(item.get('gets'))
+            elif log_time.month == now.month and user_id == item.get('id') and item.get('gets').find('水晶') != -1 and '转盘' == item.get('type'):
                 award_income += check_award_income(item.get('gets'))
     time.sleep(3)
     return award_income
@@ -474,6 +527,12 @@ def getaward_crystal():
 #    for cookie in r_session.smembers('global:auto.getaward.cookies'):
 #        check_getaward(json.loads(cookie.decode('utf-8')))
 
+#异步发送邮件
+def send_async_email(app,msg):
+    with app.app_context():
+        mail.send(msg)
+
+
 # 处理函数[重组]
 def cookies_auto(func, cookiename):
     users = r_session.smembers(cookiename)
@@ -495,6 +554,13 @@ def regular_html(info):
     regular = re.compile('<[^>]+>')
     url = unquote(info)
     return regular.sub("", url)
+
+def validateEmail(email):
+    import re
+    if len(email) > 7:
+        if re.match("^.+\\@(\\[?)[a-zA-Z0-9\\-\\.]+\\.([a-zA-Z]{2,3}|[0-9]{1,3})(\\]?)$", email) != None:
+            return 1
+    return 0
 
 # 自动日记记录
 def red_log(cook, clas, type, gets):
@@ -561,3 +627,4 @@ if __name__ == '__main__':
     threading.Thread(target=timer, args=(select_auto_task_user, 60*10)).start()
     while True:
         time.sleep(1)
+
