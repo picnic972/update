@@ -445,6 +445,7 @@ def detect_exception(user, cookies, user_info):
     account_data = json.loads(exist_account_data.decode('utf-8'))
     if not 'device_info' in account_data.keys(): return
     need_clear=True
+    exception_occured=False
     last_exception_key='last_exception:%s' % user.get('userid')
     if 'detect_info' not in user_info.keys():
         detect_info={}
@@ -468,15 +469,19 @@ def detect_exception(user, cookies, user_info):
                                 detect_info['last_warn']=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
             else:
                 red_log(user, '矿机异常', '状态', '%s:%s -> %s' % (dev['device_name'],'在线',status_cn[dev['status']]))
-                detect_info[last_exception_key]=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                exception_occured=True
             need_clear=False
+        elif last_exception_key in detect_info.keys() and dev['status'] == 'online':
+            red_log(user, '矿机恢复', '状态', '%s:  当前状态:%s' % (dev['device_name'],'在线'))
+        if exception_occured:
+            detect_info[last_exception_key]=datetime.now().strftime('%Y-%m-%d %H:%M:%S')
         if 'dcdn_clients' in dev.keys():
             for i,client in enumerate(dev['dcdn_clients']):
                 space_last_key='space_%s:%s:%s' % (i,user.get('userid'),dev['device_name'])
                 if space_last_key in detect_info.keys():
                     last_space=detect_info[space_last_key]
                     if last_space - 100*1024*1024 > int(client['space_used']):
-                        red_log(user, '缓存变动', '状态', '删除了:%.2fGB缓存,当前:%.2fGB' % (float(last_space)/1024/1024/1024-float(client['space_used'])/1024/1024/1024,float(client['space_used'])/1024/1024/1024))
+                        red_log(user, '缓存变动', '状态', '删除了:%.2fGB' % (float(last_space)/1024/1024/1024-float(client['space_used'])/1024/1024/1024))
                         detect_info[space_last_key] = int(client['space_used'])
                     elif last_space < int(client['space_used']):
                         detect_info[space_last_key] = int(client['space_used'])
